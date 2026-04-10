@@ -1,0 +1,218 @@
+var name2=table.aggregate_array("NAME_3")
+print(name2)
+var aoi=table
+.filter(ee.Filter.eq("NAME_2","Bhola"))
+print(table)
+
+
+// ---------------------------
+// 1️⃣ Define Region of Interest
+// ---------------------------
+// Sylhet ROI is already defined
+var Bhola = aoi.geometry(); // replace with your geometry
+
+Map.centerObject(Bhola, 10);
+Map.addLayer(Bhola, {color: 'red'}, 'Bhola');
+
+// ---------------------------
+// 2️⃣ Load Sentinel-1 SAR Collection
+// ---------------------------
+var collectionVV = ee.ImageCollection('COPERNICUS/S1_GRD')
+  .filter(ee.Filter.eq('instrumentMode', 'IW'))
+  .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VV'))
+  .filter(ee.Filter.eq('orbitProperties_pass', 'DESCENDING'))
+  .filterMetadata('resolution_meters', 'equals', 10)
+  .filterBounds(Bhola)
+  .select('VV');
+
+var collectionVH = ee.ImageCollection('COPERNICUS/S1_GRD')
+  .filter(ee.Filter.eq('instrumentMode', 'IW'))
+  .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VH'))
+  .filter(ee.Filter.eq('orbitProperties_pass', 'DESCENDING'))
+  .filterMetadata('resolution_meters', 'equals', 10)
+  .filterBounds(Bhola)
+  .select('VH');
+
+print(collectionVV, 'VV Collection');
+print(collectionVH, 'VH Collection');
+
+// ---------------------------
+// 3️⃣ Filter by date for before and after flood
+// ---------------------------
+var beforeVV = collectionVV.filterDate('2025-05-01', '2025-05-31').max().clip(Bhola);
+var afterVV = collectionVV.filterDate('2025-06-01', '2025-06-30').max().clip(Bhola);
+var beforeVH = collectionVH.filterDate('2025-05-01', '2025-05-31').max().clip(Bhola);
+var afterVH = collectionVH.filterDate('2025-06-01', '2025-06-30').max().clip(Bhola);
+
+// ---------------------------
+// 4️⃣ Apply speckle reduction (focal mean)
+// ---------------------------
+var SMOOTHING_RADIUS = 50; // meters
+beforeVV = beforeVV.focal_mean(SMOOTHING_RADIUS, 'circle', 'meters');
+beforeVH = beforeVH.focal_mean(SMOOTHING_RADIUS, 'circle', 'meters');
+afterVV = afterVV.focal_mean(SMOOTHING_RADIUS, 'circle', 'meters');
+afterVH = afterVH.focal_mean(SMOOTHING_RADIUS, 'circle', 'meters');
+
+// ---------------------------
+// 5️⃣ Compute VV+VH combined ratio for flood detection
+// ---------------------------
+var ratioVH = afterVH.divide(beforeVH);
+var ratioVV = afterVV.divide(beforeVV);
+
+// Combined flood mask: VH ratio >1.5 AND VV ratio >1.2
+var floodedCombined = ratioVH.gt(1.25).and(ratioVV.gt(1.2));
+var floodedMasked = floodedCombined.updateMask(floodedCombined);
+
+// Display flooded areas
+Map.addLayer(floodedMasked, {palette: "0000FF"}, 'Flooded Areas VV+VH', 1);
+Map.addLayer(floodedCombined, {}, 'combined Flooded Areas VV+VH');
+Map.addLayer(ratioVH, {min:0, max:2}, 'VH Ratio', 0);
+Map.addLayer(ratioVV, {min:0, max:2}, 'VV Ratio', 0);
+
+// ---------------------------
+// 6️⃣ Calculate total flooded area
+// ---------------------------
+var pixelArea = ee.Image.pixelArea();
+var floodedPixelArea = pixelArea.updateMask(floodedMasked);
+var floodedArea = floodedPixelArea.reduceRegion({
+  reducer: ee.Reducer.sum(),
+  geometry: Bhola,
+  scale: 10,
+  maxPixels: 1e13
+});
+
+var floodedArea_m2 = floodedArea.get('area');
+var floodedArea_km2 = ee.Number(floodedArea_m2).divide(1e6);
+print('Total Flooded Area (m²):', floodedArea_m2);
+print('Total Flooded Area (km²):', floodedArea_km2);
+
+// ---------------------------
+// 7️⃣ Optional: Export flooded area as GeoTIFF
+// ---------------------------
+Export.image.toDrive({
+  image: floodedMasked,
+  description: 'Sylhet_Flood_VV_VH_Aug2023',
+  scale: 10,
+  region: Bhola,
+  maxPixels: 1e13
+});
+
+
+
+
+//////Flood recovery
+
+
+
+// ==========================================
+// 2. Process NASA VNP46A2 NTL Data
+// ==========================================
+var ntlCol = ee.ImageCollection("NASA/VIIRS/002/VNP46A2")
+  .select('Gap_Filled_DNB_BRDF_Corrected_NTL');
+
+// Helper function to calculate mean NTL for a specific time window
+function getMeanNTL(start, end) {
+  return ntlCol.filterDate(start, end).mean().clip(Bhola);
+}
+
+// Define the three temporal windows for the flood event
+var pre  = getMeanNTL('2025-01-01', '2025-06-30'); // Baseline before flood
+var post = getMeanNTL('2025-08-01', '2025-10-31'); // Immediate aftermath
+var rec  = getMeanNTL('2026-01-01', '2026-03-30'); // Recovery period
+
+// Calculate NTL Recovery Index: (Recovery - Post-flood) / Pre-flood
+// An offset of 0.1 is added to the denominator to prevent division by zero errors
+var ntlRecovery = rec.subtract(post)
+  .divide(pre.add(0.1)) 
+  .rename('NTL_Recovery');
+
+
+// ==========================================
+// 3. Process Independent Variables (X)
+// ==========================================
+
+// Variable 1: Population Density (WorldPop)
+var pop = ee.ImageCollection("WorldPop/GP/100m/pop").filterDate('2020').mean();
+var popDensity = pop.rename('PopDensity').clip(Bhola);
+
+// Variable 2: Wealth Index (Meta RWI)
+// Note: We keep this as a FeatureCollection of points. We will extract the 'rwi' 
+// property directly during the sampling phase instead of converting it to an image.
+var rwi = ee.FeatureCollection("projects/sat-io/open-datasets/facebook/relative_wealth_index")
+  .filterBounds(Bhola);
+
+// Variable 3: Road Density (GHSL)
+var ghsl = ee.ImageCollection("JRC/GHSL/P2023A/GHS_BUILT_C").first();
+// Value 5 represents Road surfaces / Open spaces in this dataset
+var roads = ghsl.select('built_characteristics').eq(5);
+// Calculate the mean density of roads within a 500-meter circular kernel
+var roadDensity = roads.reduceNeighborhood({
+  reducer: ee.Reducer.mean(),
+  kernel: ee.Kernel.circle(500, 'meters'),
+}).rename('RoadDensity').clip(Bhola);
+
+
+// ==========================================
+// 4. Data Sampling & Preparation
+// ==========================================
+
+// Create a multi-band image (stack) of the raster variables
+// Note: Wealth is excluded here because it will be pulled from the RWI points directly
+var stack = ntlRecovery
+  .addBands(popDensity)
+  .addBands(roadDensity);
+
+// Sample the raster stack at the exact locations of the RWI wealth points
+var regressionData = stack.sampleRegions({
+  collection: rwi,       // Use the RWI point locations as anchors
+  properties: ['rwi'],   // Extract the raw wealth score directly from the point data
+  scale: 100,            // Sample at 100m resolution (matches WorldPop)
+  geometries: true       // Keep spatial coordinates for potential spatial analysis later
+}).map(function(f) {
+  // Add a 'constant' column filled with 1s. This is required by the OLS regression
+  // algorithm to calculate the Y-intercept (β0).
+  return f.set('constant', 1);
+}).filter(ee.Filter.notNull(['NTL_Recovery', 'PopDensity', 'rwi', 'RoadDensity'])); 
+// Drop any row that contains missing data to ensure the regression runs smoothly
+
+
+// ==========================================
+// 5. Ordinary Least Squares (OLS) Regression
+// ==========================================
+
+// Run Linear Regression: NTL_Recovery ~ PopDensity + rwi + RoadDensity
+var result = regressionData.reduceColumns({
+  reducer: ee.Reducer.linearRegression({numX: 4, numY: 1}),
+  // The order here is critical: [X1, X2, X3, X4, Y]
+  selectors: ['constant', 'PopDensity', 'rwi', 'RoadDensity', 'NTL_Recovery']
+});
+
+
+// ==========================================
+// 6. Output & Visualization
+// ==========================================
+
+// Extract the calculated coefficients matrix and transpose it for easier reading
+var coefficients = ee.Array(result.get('coefficients')).transpose();
+
+print('--- Regression Results ---');
+print('Intercept (β0):', coefficients.get([0,0]));
+print('PopDensity Coeff (β1):', coefficients.get([0,1]));
+print('Wealth (RWI) Coeff (β2):', coefficients.get([0,2])); 
+print('RoadDensity Coeff (β3):', coefficients.get([0,3]));
+
+// Add raster layers to the map for visual inspection
+Map.addLayer(ntlRecovery, {min: -0.5, max: 0.5, palette: ['red', 'white', 'green']}, 'NTL Recovery Index');
+Map.addLayer(popDensity, {min: 0, max: 50, palette: ['white', 'purple']}, 'Population Density');
+// (Wealth image is no longer visualized here as it remains a point collection)
+
+
+// ==========================================
+// 7. Data Export
+// ==========================================
+// Export the final compiled data table to Google Drive for external analysis (e.g., Python/R)
+Export.table.toDrive({
+  collection: regressionData,
+  description: 'Bhola_SocioEconomic_Recovery_Table',
+  fileFormat: 'CSV'
+});
